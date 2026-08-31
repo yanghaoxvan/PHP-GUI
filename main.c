@@ -9,6 +9,8 @@
 #include <shlwapi.h>
 #include <string.h>
 #include <winreg.h>
+#include <ctype.h>
+#include <shlobj.h>     // 用于 SHBrowseForFolderW
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -24,6 +26,9 @@
 #define ID_SAVE_BTN      1003
 #define ID_STATUS        1004
 #define ID_HELP_BTN      1005
+#define ID_SCAN_BTN      1006
+#define ID_BROWSE_BTN    1007
+#define ID_FOLDER_LIST   1008
 
 #define ID_MEMORY_LIMIT  1010
 #define ID_UPLOAD_SIZE   1011
@@ -54,8 +59,11 @@
 HINSTANCE hInst;
 HWND hTab, hProgress, hStatus;
 HWND hPanel1, hPanel2, hPanel3;
+HWND hFolderList;  // 文件夹列表控件
 WCHAR g_iniPath[MAX_PATH] = {0};
+WCHAR g_selectedFolder[MAX_PATH] = {0};
 BOOL g_isAdmin = FALSE;
+BOOL g_isScanning = FALSE;
 
 // 控件句柄
 HWND hMemoryEdit, hUploadEdit, hPostEdit, hTimezoneEdit, hMaxExecEdit, hMaxInputEdit;
@@ -63,6 +71,34 @@ HWND hDisplayErrors, hErrorReporting, hLogErrors;
 HWND hMaxFileEdit, hAllowUrlFopen, hShortOpenTag, hAspTags, hZlibCompress;
 HWND hSessionAuto, hSessionNameEdit;
 HWND hOpcacheEnable, hOpcacheMemEdit;
+
+// ==================== 全盘扫描相关 ====================
+#define MAX_FOLDERS 512
+
+typedef struct {
+	WCHAR path[MAX_PATH];
+} FolderEntry;
+
+FolderEntry g_foundFolders[MAX_FOLDERS];
+int g_folderCount = 0;
+
+// 常用路径列表（用于快速检查）
+const WCHAR* g_commonPaths[] = {
+	L"C:\\php",
+	L"C:\\PHP",
+	L"D:\\php",
+	L"D:\\PHP",
+	L"C:\\Program Files\\PHP",
+	L"C:\\xampp\\php",
+	L"C:\\wamp\\php",
+	L"D:\\xampp\\php",
+	L"D:\\wamp\\php",
+	L"C:\\php-8.2.33-nts-vs16-x64",
+	L"C:\\php-8.2.33-ts-vs16-x64",
+	L"C:\\php-8.3.0-vc17",
+	L"C:\\php-8.1.0-nts-vc16",
+	NULL
+};
 
 // ==================== 工具函数 ====================
 
@@ -95,13 +131,36 @@ BOOL GetPhpPathFromRegistry(WCHAR* outPath, DWORD size) {
 	return FALSE;
 }
 
-// ==================== 搜索包含 "php" 的文件夹，再找 php.ini ====================
+// ==================== 全盘扫描功能 ====================
 
-void FindPhpIniPathRecursive(const WCHAR* directory, int depth) {
+// 检查文件夹名是否匹配关键词（php / ts / vc / 数字）
+int IsTargetFolder(const WCHAR* folderName) {
+	// 转小写（宽字符版）
+	WCHAR lower[MAX_PATH];
+	wcscpy(lower, folderName);
+	for (int i = 0; lower[i]; i++) lower[i] = towlower(lower[i]);
+	
+	// 检查关键词
+	int hasPhp = (wcsstr(lower, L"php") != NULL);
+	int hasTs  = (wcsstr(lower, L"ts") != NULL);
+	int hasVc  = (wcsstr(lower, L"vc") != NULL);
+	
+	// 检查是否包含数字
+	int hasDigit = 0;
+	for (int i = 0; folderName[i]; i++) {
+		if (iswdigit(folderName[i])) { hasDigit = 1; break; }
+	}
+	
+	return (hasPhp || hasTs || hasVc || hasDigit);
+}
+
+// 递归扫描（深度限制 3 层）
+void ScanAllDrivesRecursive(const WCHAR* basePath, int depth) {
 	if (depth > 3) return;
+	if (g_folderCount >= MAX_FOLDERS) return;
 	
 	WCHAR searchPath[MAX_PATH];
-	wsprintfW(searchPath, L"%s\\*", directory);
+	wsprintfW(searchPath, L"%s\\*", basePath);
 	
 	WIN32_FIND_DATAW fd;
 	HANDLE hFind = FindFirstFileW(searchPath, &fd);
@@ -111,59 +170,120 @@ void FindPhpIniPathRecursive(const WCHAR* directory, int depth) {
 		if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
 		
 		if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-			// 检查文件夹名是否包含 "php"
-			if (wcsstr(fd.cFileName, L"php") != NULL) {
-				// 进入这个文件夹，直接找 php.ini
-				WCHAR targetPath[MAX_PATH];
-				wsprintfW(targetPath, L"%s\\%s\\php.ini", directory, fd.cFileName);
-				if (GetFileAttributesW(targetPath) != INVALID_FILE_ATTRIBUTES) {
-					wcscpy(g_iniPath, targetPath);
-					FindClose(hFind);
-					return;
-				}
+			// 检查是否匹配关键词
+			if (IsTargetFolder(fd.cFileName)) {
+				WCHAR fullPath[MAX_PATH];
+				wsprintfW(fullPath, L"%s\\%s", basePath, fd.cFileName);
+				wcscpy(g_foundFolders[g_folderCount].path, fullPath);
+				g_folderCount++;
+				if (g_folderCount >= MAX_FOLDERS) { FindClose(hFind); return; }
 			}
 			
-			// 继续递归搜索（深度限制内）
+			// 递归进入子目录
 			WCHAR subPath[MAX_PATH];
-			wsprintfW(subPath, L"%s\\%s", directory, fd.cFileName);
-			FindPhpIniPathRecursive(subPath, depth + 1);
-			if (g_iniPath[0] != 0) {
-				FindClose(hFind);
-				return;
-			}
+			wsprintfW(subPath, L"%s\\%s", basePath, fd.cFileName);
+			ScanAllDrivesRecursive(subPath, depth + 1);
+			if (g_folderCount >= MAX_FOLDERS) { FindClose(hFind); return; }
 		}
 	} while (FindNextFileW(hFind, &fd));
 	
 	FindClose(hFind);
 }
 
+// 扫描所有盘符
+void ScanAllDrives(void) {
+	if (g_isScanning) return;
+	g_isScanning = TRUE;
+	g_folderCount = 0;
+	
+	// 清空列表控件
+	SendMessageW(hFolderList, CB_RESETCONTENT, 0, 0);
+	SetWindowTextW(GetDlgItem(GetParent(hFolderList), ID_STATUS), L"⏳ 正在全盘扫描...");
+	
+	DWORD drives = GetLogicalDrives();
+	for (WCHAR drive = L'C'; drive <= L'Z'; drive++) {
+		if (drives & (1 << (drive - L'A'))) {
+			WCHAR rootPath[4] = {drive, L':', L'\\', 0};
+			ScanAllDrivesRecursive(rootPath, 0);
+		}
+	}
+	
+	// 把找到的文件夹添加到列表
+	for (int i = 0; i < g_folderCount; i++) {
+		SendMessageW(hFolderList, CB_ADDSTRING, 0, (LPARAM)g_foundFolders[i].path);
+	}
+	
+	WCHAR statusMsg[256];
+	wsprintfW(statusMsg, L"✅ 扫描完成，找到 %d 个候选文件夹", g_folderCount);
+	SetWindowTextW(GetDlgItem(GetParent(hFolderList), ID_STATUS), statusMsg);
+	g_isScanning = FALSE;
+}
+
+// 检查常用路径
+int CheckCommonPaths(void) {
+	for (int i = 0; g_commonPaths[i] != NULL; i++) {
+		WCHAR iniPath[MAX_PATH];
+		wsprintfW(iniPath, L"%s\\php.ini", g_commonPaths[i]);
+		if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES) {
+			wcscpy(g_iniPath, iniPath);
+			wcscpy(g_selectedFolder, g_commonPaths[i]);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// 手动浏览文件夹
+int BrowseForPhpFolder(WCHAR* outPath) {
+	BROWSEINFOW bi = {0};
+	bi.lpszTitle = L"请选择包含 php.ini 的文件夹";
+	bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+	LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+	if (pidl != NULL) {
+		SHGetPathFromIDListW(pidl, outPath);
+		CoTaskMemFree(pidl);
+		return 1;
+	}
+	return 0;
+}
+
+// 从选中的文件夹加载 php.ini
+int LoadPhpIniFromFolder(const WCHAR* folderPath) {
+	WCHAR iniPath[MAX_PATH];
+	wsprintfW(iniPath, L"%s\\php.ini", folderPath);
+	if (GetFileAttributesW(iniPath) != INVALID_FILE_ATTRIBUTES) {
+		wcscpy(g_iniPath, iniPath);
+		wcscpy(g_selectedFolder, folderPath);
+		return 1;
+	}
+	return 0;
+}
+
+// ==================== 智能查找 php.ini（整合版） ====================
+
 void FindPhpIniPath(void) {
 	// 1. 先从注册表读取
 	if (GetPhpPathFromRegistry(g_iniPath, MAX_PATH)) {
+		// 提取目录
+		wcscpy(g_selectedFolder, g_iniPath);
+		WCHAR* p = wcsrchr(g_selectedFolder, L'\\');
+		if (p) *p = 0;
 		return;
 	}
 	
-	// 2. 从 C 盘开始递归搜索
+	// 2. 检查常用路径
+	if (CheckCommonPaths()) {
+		return;
+	}
+	
+	// 3. 从 C 盘递归搜索（仅查找 php.ini，快速模式）
 	WCHAR systemDrive[MAX_PATH];
 	GetEnvironmentVariableW(L"SystemDrive", systemDrive, MAX_PATH);
 	wsprintfW(systemDrive, L"%s\\", systemDrive);
 	
-	FindPhpIniPathRecursive(systemDrive, 0);
-	
-	// 3. 如果还是没找到，尝试常见路径
-	if (g_iniPath[0] == 0) {
-		const WCHAR* commonPaths[] = {
-			L"C:\\php\\php.ini",
-			L"C:\\PHP\\php.ini",
-			L"D:\\php\\php.ini"
-		};
-		for (int i = 0; i < 3; i++) {
-			if (GetFileAttributesW(commonPaths[i]) != INVALID_FILE_ATTRIBUTES) {
-				wcscpy(g_iniPath, commonPaths[i]);
-				return;
-			}
-		}
-	}
+	// 这里可以调用原来的快速搜索，或者直接提示用户使用全盘扫描
+	// 为了简洁，我们直接提示用户点击"全盘扫描"按钮
+	SetWindowTextW(GetDlgItem(GetParent(hFolderList), ID_STATUS), L"💡 未自动找到 php.ini，请点击「全盘扫描」或「浏览」");
 }
 
 // ==================== 文件读写工具 ====================
@@ -528,9 +648,9 @@ void ShowHelpWindow(HWND hwndParent) {
 	WCHAR phpVersion[128] = {0};
 	GetPhpVersion(phpVersion, 128);
 	
-	HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"STATIC", L"帮助 - PHP配置管家 v2.0",
+	HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"STATIC", L"帮助 - PHP配置管家 v2.1",
 								WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_SYSMENU,
-								CW_USEDEFAULT, CW_USEDEFAULT, 480, 420,
+								CW_USEDEFAULT, CW_USEDEFAULT, 480, 460,
 								hwndParent, NULL, hInst, NULL);
 	
 	HFONT hFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
@@ -574,8 +694,13 @@ void ShowHelpWindow(HWND hwndParent) {
 	CreateWindowW(L"STATIC", L"  方法二：在本工具中手动选择新版本的 php.ini", WS_CHILD | WS_VISIBLE,
 				  20, 361, 380, 20, hDlg, NULL, hInst, NULL);
 	
+	CreateWindowW(L"STATIC", L"▸ 新增功能 (v2.1)", WS_CHILD | WS_VISIBLE,
+				  20, 390, 200, 20, hDlg, NULL, hInst, NULL);
+	CreateWindowW(L"STATIC", L"  • 全盘扫描包含 php / ts / vc / 数字 的文件夹", WS_CHILD | WS_VISIBLE,
+				  20, 413, 380, 20, hDlg, NULL, hInst, NULL);
+	
 	HWND hBtn = CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-							  190, 395, 80, 30, hDlg, (HMENU)IDOK, hInst, NULL);
+							  190, 435, 80, 30, hDlg, (HMENU)IDOK, hInst, NULL);
 	SendMessageW(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 	
 	MSG msg;
@@ -614,7 +739,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		InitCommonControls();
 		FindPhpIniPath();
 		
-		SetWindowTextW(hwnd, L"PHP 配置管家 v2.0 - WINRX论坛版");
+		SetWindowTextW(hwnd, L"PHP 配置管家 v2.1 - WINRX论坛版");
 		
 		hTab = CreateWindowW(WC_TABCONTROLW, NULL, WS_CHILD | WS_VISIBLE | TCS_FIXEDWIDTH,
 							 10, 10, 680, 420, hwnd, (HMENU)ID_TAB, hInst, NULL);
@@ -731,17 +856,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 		hOpcacheMemEdit = CreateWindowW(L"EDIT", L"128", WS_CHILD | WS_VISIBLE | WS_BORDER, 200, 113, 80, 24, hPanel3, (HMENU)ID_OPCACHE_MEM, hInst, NULL);
 		CreateWindowW(L"STATIC", L"MB", WS_CHILD | WS_VISIBLE, 290, 115, 40, 20, hPanel3, NULL, hInst, NULL);
 		
-		ShowTab(0);
+		// ========== 底部控制区 ==========
+		// 文件夹选择相关控件
+		CreateWindowW(L"STATIC", L"PHP 目录:", WS_CHILD | WS_VISIBLE, 20, 395, 60, 20, hwnd, NULL, hInst, NULL);
+		
+		hFolderList = CreateWindowW(L"COMBOBOX", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+									85, 392, 250, 200, hwnd, (HMENU)ID_FOLDER_LIST, hInst, NULL);
+		
+		CreateWindowW(L"BUTTON", L"全盘扫描", WS_CHILD | WS_VISIBLE, 345, 390, 80, 28, hwnd, (HMENU)ID_SCAN_BTN, hInst, NULL);
+		CreateWindowW(L"BUTTON", L"浏览...", WS_CHILD | WS_VISIBLE, 435, 390, 60, 28, hwnd, (HMENU)ID_BROWSE_BTN, hInst, NULL);
 		
 		CreateWindowW(L"BUTTON", L"保存配置", WS_CHILD | WS_VISIBLE, 20, 435, 100, 35, hwnd, (HMENU)ID_SAVE_BTN, hInst, NULL);
-		CreateWindowW(L"BUTTON", L"帮助", WS_CHILD | WS_VISIBLE, 140, 435, 80, 35, hwnd, (HMENU)ID_HELP_BTN, hInst, NULL);
+		CreateWindowW(L"BUTTON", L"帮助", WS_CHILD | WS_VISIBLE, 130, 435, 80, 35, hwnd, (HMENU)ID_HELP_BTN, hInst, NULL);
 		CreateWindowW(L"BUTTON", L"重启 PHP (IIS)", WS_CHILD | WS_VISIBLE, 530, 435, 130, 35, hwnd, (HMENU)ID_RESTART_BTN, hInst, NULL);
 		
 		hProgress = CreateWindowW(PROGRESS_CLASSW, NULL, WS_CHILD | WS_VISIBLE, 20, 485, 640, 20, hwnd, (HMENU)ID_PROGRESS, hInst, NULL);
 		SendMessageW(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
 		
-		hStatus = CreateWindowW(L"STATIC", L"状态: 就绪", WS_CHILD | WS_VISIBLE, 20, 520, 400, 25, hwnd, (HMENU)ID_STATUS, hInst, NULL);
+		hStatus = CreateWindowW(L"STATIC", L"状态: 就绪", WS_CHILD | WS_VISIBLE, 20, 520, 600, 25, hwnd, (HMENU)ID_STATUS, hInst, NULL);
 		
+		// 加载配置
 		LoadPhpSettings();
 		break;
 	}
@@ -763,6 +897,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 			}
 			else if (LOWORD(wParam) == ID_HELP_BTN) {
 				ShowHelpWindow(hwnd);
+			}
+			else if (LOWORD(wParam) == ID_SCAN_BTN) {
+				ScanAllDrives();
+			}
+			else if (LOWORD(wParam) == ID_BROWSE_BTN) {
+				WCHAR folderPath[MAX_PATH] = {0};
+				if (BrowseForPhpFolder(folderPath)) {
+					if (LoadPhpIniFromFolder(folderPath)) {
+						SetWindowTextW(hStatus, L"✅ 已选择: %s");
+						LoadPhpSettings();
+						MessageBoxW(NULL, L"✅ 已加载该目录下的 php.ini", L"成功", MB_OK | MB_ICONINFORMATION);
+					} else {
+						MessageBoxW(NULL, L"❌ 该目录下未找到 php.ini", L"提示", MB_OK | MB_ICONWARNING);
+					}
+				}
+			}
+			else if (LOWORD(wParam) == ID_FOLDER_LIST && HIWORD(wParam) == CBN_SELCHANGE) {
+				// 从列表中选择文件夹
+				int sel = SendMessageW(hFolderList, CB_GETCURSEL, 0, 0);
+				if (sel != CB_ERR && sel < g_folderCount) {
+					if (LoadPhpIniFromFolder(g_foundFolders[sel].path)) {
+						LoadPhpSettings();
+						SetWindowTextW(hStatus, L"✅ 已加载: %s");
+						MessageBoxW(NULL, L"✅ 已加载该目录下的 php.ini", L"成功", MB_OK | MB_ICONINFORMATION);
+					}
+				}
 			}
 			break;
 		}
@@ -796,7 +956,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 	wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 	RegisterClassW(&wc);
 	
-	HWND hwnd = CreateWindowExW(0, L"PHPConfigTool", L"PHP 配置管家 v2.0 - WINRX论坛版",
+	HWND hwnd = CreateWindowExW(0, L"PHPConfigTool", L"PHP 配置管家 v2.1 - WINRX论坛版",
 								WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
 								720, 600, NULL, NULL, hInstance, NULL);
 	if (!hwnd) return 0;
